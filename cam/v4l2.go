@@ -40,6 +40,7 @@ var (
 func v4l2Ctl(args ...string) (string, error) {
 	cmd := exec.Command("v4l2-ctl", args...)
 	out, err := cmd.CombinedOutput()
+	logCmdOutput("v4l2-ctl", args, string(out), err)
 	if err != nil {
 		return "", fmt.Errorf(
 			"v4l2-ctl %s: %w: %s",
@@ -96,13 +97,13 @@ func (cam Camera) LoopbackName() string {
 	if sub == "" {
 		sub = base
 	}
-	return fmt.Sprintf("lo_%s: %s", base, sub)
+	return fmt.Sprintf("lo_%s - %s", base, sub)
 }
 
 func (cam Camera) SubName() string {
 	name := cam.Name
-	if i := strings.Index(name, ":"); i >= 0 {
-		return strings.TrimSpace(name[:i])
+	if before, _, ok := strings.Cut(name, ":"); ok {
+		return strings.TrimSpace(before)
 	}
 	return strings.TrimSpace(name)
 
@@ -112,7 +113,7 @@ func parseListDevices(output string) map[string][]V4L2_Device {
 	ret := map[string][]V4L2_Device{}
 	var current string
 
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -125,8 +126,8 @@ func parseListDevices(output string) map[string][]V4L2_Device {
 			continue
 		}
 
-		if strings.HasSuffix(line, ":") {
-			current = strings.TrimSuffix(line, ":")
+		if before, ok := strings.CutSuffix(line, ":"); ok {
+			current = before
 		}
 	}
 
@@ -153,7 +154,7 @@ func parseFormatsExt(output string) []V42L_ColorFormat {
 		resolution = nil
 	}
 
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

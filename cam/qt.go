@@ -20,7 +20,9 @@ type ui struct {
 	framerateCombo   *qt6.QComboBox
 
 	cameras        []Camera
+	loopback       *Loopback
 	loopbackActive bool
+	shuttingDown   bool
 	playIcon       *qt6.QIcon
 	stopIcon       *qt6.QIcon
 }
@@ -31,8 +33,12 @@ func RunGUI(args []string) {
 	qt6.NewQApplication(args)
 	defer qt6.QApplication_Exec()
 
+	icon := cameraIcon()
+	qt6.QGuiApplication_SetWindowIcon(icon)
+
 	win := qt6.NewQWidget(nil)
 	win.SetWindowTitle("Cam Config")
+	win.SetWindowIcon(icon)
 	win.SetMinimumSize2(360, 120)
 
 	style := qt6.QApplication_Style()
@@ -87,6 +93,11 @@ func RunGUI(args []string) {
 	root.AddLayout(formatRow.QLayout)
 
 	u.refreshCameras()
+	win.OnCloseEvent(func(_ func(_ *qt6.QCloseEvent), _ *qt6.QCloseEvent) {
+		u.shuttingDown = true
+		u.shutdownLoopback()
+		qt6.QCoreApplication_Quit()
+	})
 	win.Show()
 }
 
@@ -108,12 +119,110 @@ func (u *ui) setLoopbackActive(active bool) {
 }
 
 func (u *ui) toggleLoopback() {
-	if !u.loopbackActive {
-		if strings.TrimSpace(u.loopbackName.Text()) == "" {
-			u.loopbackName.SetText(u.defaultLoopbackName())
-		}
+	if u.loopbackActive {
+		u.stopLoopback()
+		return
 	}
-	u.setLoopbackActive(!u.loopbackActive)
+
+	if strings.TrimSpace(u.loopbackName.Text()) == "" {
+		u.loopbackName.SetText(u.defaultLoopbackName())
+	}
+
+	cfg, err := u.loopbackConfig()
+	if err != nil {
+		u.loopbackName.SetPlaceholderText(err.Error())
+		return
+	}
+
+	u.loopbackBtn.SetEnabled(false)
+	go func() {
+		lb, err := cfg.Start()
+		mainthread.Start(func() {
+			if u.shuttingDown {
+				if lb != nil {
+					_ = lb.Stop()
+				}
+				return
+			}
+			u.loopbackBtn.SetEnabled(true)
+			if err != nil {
+				u.loopbackName.SetPlaceholderText(err.Error())
+				return
+			}
+			u.loopback = lb
+			u.loopbackName.SetPlaceholderText("Loopback device name")
+			u.setLoopbackActive(true)
+		})
+	}()
+}
+
+func (u *ui) stopLoopback() {
+	lb := u.loopback
+	u.loopback = nil
+	u.loopbackBtn.SetEnabled(false)
+
+	var err error
+	if lb != nil {
+		err = lb.Stop()
+	}
+
+	u.loopbackBtn.SetEnabled(true)
+	u.setLoopbackActive(false)
+	if err != nil {
+		u.loopbackName.SetPlaceholderText(err.Error())
+	}
+}
+
+func (u *ui) shutdownLoopback() {
+	lb := u.loopback
+	u.loopback = nil
+	if lb != nil {
+		_ = lb.Stop()
+	}
+	u.setLoopbackActive(false)
+}
+
+func (u *ui) loopbackConfig() (LoopbackConfig, error) {
+	camIdx := u.cameraCombo.CurrentIndex()
+	fmtIdx := u.colorFormatCombo.CurrentIndex()
+	resIdx := u.resolutionCombo.CurrentIndex()
+	fpsIdx := u.framerateCombo.CurrentIndex()
+
+	if camIdx < 0 || camIdx >= len(u.cameras) {
+		return LoopbackConfig{}, fmt.Errorf("no camera selected")
+	}
+	if fmtIdx < 0 || fmtIdx >= len(u.cameras[camIdx].ColorFormats) {
+		return LoopbackConfig{}, fmt.Errorf("no color format selected")
+	}
+
+	resolutions := sortedResolutions(u.cameras[camIdx].ColorFormats[fmtIdx].Resolutions)
+	if resIdx < 0 || resIdx >= len(resolutions) {
+		return LoopbackConfig{}, fmt.Errorf("no resolution selected")
+	}
+
+	fpsText := u.framerateCombo.ItemText(fpsIdx)
+	if fpsText == "" || fpsText == "(none)" {
+		return LoopbackConfig{}, fmt.Errorf("no frame rate selected")
+	}
+	fps, err := parseFPSLabel(fpsText)
+	if err != nil {
+		return LoopbackConfig{}, fmt.Errorf("invalid frame rate: %w", err)
+	}
+
+	name := strings.TrimSpace(u.loopbackName.Text())
+	if name == "" {
+		return LoopbackConfig{}, fmt.Errorf("no loopback name")
+	}
+
+	res := resolutions[resIdx]
+	return LoopbackConfig{
+		Name:      name,
+		Source:    u.cameras[camIdx].Device,
+		Format:    u.cameras[camIdx].ColorFormats[fmtIdx].ShortName,
+		Width:     res.Width,
+		Height:    res.Height,
+		FrameRate: fps,
+	}, nil
 }
 
 func (u *ui) defaultLoopbackName() string {
@@ -294,6 +403,16 @@ func sortedResolutions(res []V42L_Resolution) []V42L_Resolution {
 
 func resolutionLabel(res V42L_Resolution) string {
 	return fmt.Sprintf("%d×%d", res.Width, res.Height)
+}
+
+func cameraIcon() *qt6.QIcon {
+	for _, name := range []string{"camera-video", "camera-web", "camera-photo"} {
+		icon := qt6.QIcon_FromTheme(name)
+		if !icon.IsNull() {
+			return icon
+		}
+	}
+	return qt6.NewQIcon()
 }
 
 func fpsLabel(fps float32) string {
