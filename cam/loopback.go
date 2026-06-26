@@ -1,9 +1,7 @@
 package cam
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -12,12 +10,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-)
-
-const (
-	watchdogInterval    = 1 * time.Second
-	frameProbeTimeout   = 3 * time.Second
-	staleFramesRequired = 5
 )
 
 type LoopbackConfig struct {
@@ -30,15 +22,13 @@ type LoopbackConfig struct {
 }
 
 type Loopback struct {
-	cfg             LoopbackConfig
-	outputDevice    V4L2_Device
-	ffmpeg          *exec.Cmd
-	lastFrame       []byte
-	consecutiveSame int
-	stop            chan struct{}
-	stopOnce        sync.Once
-	stopErr         error
-	mu              sync.Mutex
+	cfg          LoopbackConfig
+	outputDevice V4L2_Device
+	ffmpeg       *exec.Cmd
+	stop         chan struct{}
+	stopOnce     sync.Once
+	stopErr      error
+	mu           sync.Mutex
 }
 
 var reLoopbackDevice = regexp.MustCompile(`/dev/video\d+`)
@@ -76,7 +66,7 @@ func (cfg LoopbackConfig) Start() (*Loopback, error) {
 		return nil, err
 	}
 
-	go lb.watchdog()
+	logLoopbackReady(device)
 	return lb, nil
 }
 
@@ -107,30 +97,28 @@ func (lb *Loopback) Stop() error {
 	return lb.stopErr
 }
 
+func (lb *Loopback) Reset() error {
+	if lb == nil {
+		return fmt.Errorf("loopback not running")
+	}
+
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	select {
+	case <-lb.stop:
+		return fmt.Errorf("loopback stopped")
+	default:
+	}
+
+	return lb.restartPipelineLocked("manual reset")
+}
+
 func (lb *Loopback) OutputDevice() V4L2_Device {
 	if lb == nil {
 		return ""
 	}
 	return lb.outputDevice
-}
-
-func (lb *Loopback) watchdog() {
-	ticker := time.NewTicker(watchdogInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-lb.stop:
-			return
-		case <-ticker.C:
-			lb.mu.Lock()
-			reason := lb.stallReasonLocked()
-			if reason != "" {
-				_ = lb.restartPipelineLocked(reason)
-			}
-			lb.mu.Unlock()
-		}
-	}
 }
 
 func (lb *Loopback) startPipeline() error {
@@ -139,21 +127,10 @@ func (lb *Loopback) startPipeline() error {
 	return lb.restartPipelineLocked("")
 }
 
-func (lb *Loopback) stallReasonLocked() string {
-	if lb.ffmpegExitedLocked() {
-		return "ffmpeg exited"
-	}
-	if lb.framesAreStaleLocked() {
-		return "stale frames"
-	}
-	return ""
-}
-
 func (lb *Loopback) restartPipelineLocked(reason string) error {
 	if reason != "" {
 		logRestart(reason)
 	}
-	lb.resetStaleTracking()
 
 	old := lb.ffmpeg
 	lb.ffmpeg = nil
@@ -165,6 +142,10 @@ func (lb *Loopback) restartPipelineLocked(reason string) error {
 
 	if err := configureCapture(lb.cfg); err != nil {
 		return fmt.Errorf("configure capture device: %w", err)
+	}
+
+	if err := configureLoopbackDevice(lb.outputDevice, lb.cfg); err != nil {
+		return fmt.Errorf("configure loopback device: %w", err)
 	}
 
 	cmd, err := startFFmpeg(lb.cfg, lb.outputDevice)
@@ -183,65 +164,9 @@ func (lb *Loopback) monitorFFmpeg(cmd *exec.Cmd) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	select {
-	case <-lb.stop:
-		return
-	default:
+	if lb.ffmpeg == cmd {
+		lb.ffmpeg = nil
 	}
-
-	// Intentional stop/restart already cleared or replaced lb.ffmpeg.
-	if lb.ffmpeg != cmd {
-		return
-	}
-
-	lb.ffmpeg = nil
-	_ = lb.restartPipelineLocked("ffmpeg exited")
-}
-
-func (lb *Loopback) ffmpegExitedLocked() bool {
-	if lb.ffmpeg == nil || lb.ffmpeg.Process == nil {
-		return true
-	}
-	return lb.ffmpeg.ProcessState != nil && lb.ffmpeg.ProcessState.Exited()
-}
-
-func (lb *Loopback) resetStaleTracking() {
-	lb.lastFrame = nil
-	lb.consecutiveSame = 0
-}
-
-func (lb *Loopback) framesAreStaleLocked() bool {
-	select {
-	case <-lb.stop:
-		return false
-	default:
-	}
-
-	frameSize := loopbackFrameByteSize(lb.cfg.Width, lb.cfg.Height)
-	device := lb.outputDevice
-
-	lb.mu.Unlock()
-	frame, err := grabLoopbackFrame(device, frameSize)
-	lb.mu.Lock()
-	if err != nil {
-		return false
-	}
-
-	if lb.lastFrame == nil {
-		lb.lastFrame = frame
-		lb.consecutiveSame = 1
-		return false
-	}
-
-	if bytes.Equal(lb.lastFrame, frame) {
-		lb.consecutiveSame++
-	} else {
-		lb.lastFrame = frame
-		lb.consecutiveSame = 1
-		return false
-	}
-
-	return lb.consecutiveSame >= staleFramesRequired
 }
 
 func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
@@ -269,29 +194,6 @@ func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
 	}
 }
 
-func loopbackFrameByteSize(width, height int) int {
-	// ffmpeg always writes YUYV to the loopback output.
-	return width * height * 2
-}
-
-func grabLoopbackFrame(device V4L2_Device, frameSize int) ([]byte, error) {
-	file, err := os.Open(string(device))
-	if err != nil {
-		return nil, fmt.Errorf("open loopback device: %w", err)
-	}
-	defer file.Close()
-
-	if err := file.SetDeadline(time.Now().Add(frameProbeTimeout)); err != nil {
-		return nil, fmt.Errorf("set read deadline: %w", err)
-	}
-
-	buf := make([]byte, frameSize)
-	if _, err := io.ReadFull(file, buf); err != nil {
-		return nil, fmt.Errorf("read frame: %w", err)
-	}
-	return buf, nil
-}
-
 func createLoopbackDevice(cfg LoopbackConfig) (V4L2_Device, error) {
 	fps := int(cfg.FrameRate + 0.5)
 	out, err := loopbackCtl(
@@ -301,6 +203,8 @@ func createLoopbackDevice(cfg LoopbackConfig) (V4L2_Device, error) {
 		"-h", strconv.Itoa(cfg.Height),
 		"--min-width", strconv.Itoa(cfg.Width),
 		"--min-height", strconv.Itoa(cfg.Height),
+		"-b", "8",
+		"-o", "8",
 		"-x", "1",
 		"-v",
 	)
@@ -318,10 +222,26 @@ func createLoopbackDevice(cfg LoopbackConfig) (V4L2_Device, error) {
 		return "", err
 	}
 
-	// Repeat the last frame when input stalls so identical-frame detection works.
-	_, _ = v4l2Ctl("-d", string(device), "-c", "sustain_framerate=1")
-
 	return device, nil
+}
+
+func configureLoopbackDevice(device V4L2_Device, cfg LoopbackConfig) error {
+	_, err := v4l2Ctl(
+		"-d", string(device),
+		fmt.Sprintf("--set-fmt-video-out=width=%d,height=%d,pixelformat=YUYV", cfg.Width, cfg.Height),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Repeat frames at the target rate so PipeWire/Chromium consumers see a live stream.
+	_, _ = v4l2Ctl("-d", string(device), "-c", "sustain_framerate=1")
+	return nil
+}
+
+func logLoopbackReady(device V4L2_Device) {
+	fmt.Fprintf(os.Stderr, "[cam-config] loopback ready at %s\n", device)
+	fmt.Fprintf(os.Stderr, "[cam-config] flatpak browsers reach cameras via PipeWire; if video stays blank, try a native browser or grant device access with flatpak override --user --device=all <app-id>\n")
 }
 
 func deleteLoopbackDevice(device V4L2_Device) error {
@@ -329,11 +249,16 @@ func deleteLoopbackDevice(device V4L2_Device) error {
 	return err
 }
 
+// ConfigureCapture applies the selected format and frame rate to the source device.
+func ConfigureCapture(cfg LoopbackConfig) error {
+	return configureCapture(cfg)
+}
+
 func configureCapture(cfg LoopbackConfig) error {
 	fps := int(cfg.FrameRate + 0.5)
 	_, err := v4l2Ctl(
 		"-d", string(cfg.Source),
-		fmt.Sprintf("--set-fmt-video=width=%d,height=%d,pixelformat=%s", cfg.Width, cfg.Height, cfg.Format),
+		fmt.Sprintf("--set-fmt-video=width=%d,height=%d,pixelformat=%s", cfg.Width, cfg.Height, v4l2PixelFormat(cfg.Format)),
 	)
 	if err != nil {
 		return err
@@ -346,17 +271,25 @@ func startFFmpeg(cfg LoopbackConfig, output V4L2_Device) (*exec.Cmd, error) {
 	fps := strconv.FormatFloat(float64(cfg.FrameRate), 'g', -1, 32)
 	size := fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
 
+	// Read in real time and emit a steady YUYV stream. Browsers via PipeWire need
+	// continuous frames with timestamps; burst-then-stall causes ready-timeout errors.
 	args := []string{
 		"-hide_banner",
 		"-nostats",
 		"-loglevel", "warning",
+		"-thread_queue_size", "512",
+		"-re",
+		"-fflags", "+genpts",
+		"-use_wallclock_as_timestamps", "1",
 		"-f", "v4l2",
 		"-input_format", ffmpegInputFormat(cfg.Format),
 		"-video_size", size,
 		"-framerate", fps,
 		"-i", string(cfg.Source),
-		"-f", "v4l2",
 		"-pix_fmt", "yuyv422",
+		"-r", fps,
+		"-fps_mode", "cfr",
+		"-f", "v4l2",
 		string(output),
 	}
 
@@ -392,6 +325,15 @@ func parseLoopbackDevice(output string) (V4L2_Device, bool) {
 		return "", false
 	}
 	return V4L2_Device(matches[len(matches)-1]), true
+}
+
+func v4l2PixelFormat(fourcc string) string {
+	switch strings.ToUpper(fourcc) {
+	case "MJPEG":
+		return "MJPG"
+	default:
+		return strings.ToUpper(fourcc)
+	}
 }
 
 func ffmpegInputFormat(fourcc string) string {

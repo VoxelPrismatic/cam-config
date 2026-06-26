@@ -13,6 +13,7 @@ import (
 type ui struct {
 	loopbackName     *qt6.QLineEdit
 	loopbackBtn      *qt6.QPushButton
+	resetBtn         *qt6.QPushButton
 	cameraCombo      *qt6.QComboBox
 	refreshBtn       *qt6.QPushButton
 	colorFormatCombo *qt6.QComboBox
@@ -54,6 +55,11 @@ func RunGUI(args []string) {
 	u.loopbackBtn.SetIcon(u.playIcon)
 	u.loopbackBtn.OnClicked(u.toggleLoopback)
 
+	u.resetBtn = qt6.NewQPushButton2()
+	u.resetBtn.SetIcon(style.StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil))
+	u.resetBtn.SetEnabled(false)
+	u.resetBtn.OnClicked(u.resetLoopback)
+
 	u.cameraCombo = qt6.NewQComboBox2()
 	u.cameraCombo.OnCurrentIndexChanged(u.onCameraChanged)
 
@@ -71,9 +77,11 @@ func RunGUI(args []string) {
 	u.resolutionCombo.OnCurrentIndexChanged(u.onResolutionChanged)
 
 	u.framerateCombo = qt6.NewQComboBox2()
+	u.framerateCombo.OnCurrentIndexChanged(u.onFramerateChanged)
 
 	loopbackRow := qt6.NewQHBoxLayout2()
 	loopbackRow.AddWidget2(u.loopbackName.QWidget, 1)
+	loopbackRow.AddWidget(u.resetBtn.QWidget)
 	loopbackRow.AddWidget(u.loopbackBtn.QWidget)
 
 	cameraRow := qt6.NewQHBoxLayout2()
@@ -111,10 +119,26 @@ func (u *ui) setLoopbackActive(active bool) {
 	u.resolutionCombo.SetEnabled(!active)
 	u.framerateCombo.SetEnabled(!active)
 
+	u.resetBtn.SetEnabled(active)
+
 	if active {
 		u.loopbackBtn.SetIcon(u.stopIcon)
 	} else {
 		u.loopbackBtn.SetIcon(u.playIcon)
+	}
+}
+
+func (u *ui) resetLoopback() {
+	lb := u.loopback
+	if lb == nil {
+		return
+	}
+
+	u.resetBtn.SetEnabled(false)
+	err := lb.Reset()
+	u.resetBtn.SetEnabled(true)
+	if err != nil {
+		u.loopbackName.SetPlaceholderText(err.Error())
 	}
 }
 
@@ -183,30 +207,9 @@ func (u *ui) shutdownLoopback() {
 }
 
 func (u *ui) loopbackConfig() (LoopbackConfig, error) {
-	camIdx := u.cameraCombo.CurrentIndex()
-	fmtIdx := u.colorFormatCombo.CurrentIndex()
-	resIdx := u.resolutionCombo.CurrentIndex()
-	fpsIdx := u.framerateCombo.CurrentIndex()
-
-	if camIdx < 0 || camIdx >= len(u.cameras) {
-		return LoopbackConfig{}, fmt.Errorf("no camera selected")
-	}
-	if fmtIdx < 0 || fmtIdx >= len(u.cameras[camIdx].ColorFormats) {
-		return LoopbackConfig{}, fmt.Errorf("no color format selected")
-	}
-
-	resolutions := sortedResolutions(u.cameras[camIdx].ColorFormats[fmtIdx].Resolutions)
-	if resIdx < 0 || resIdx >= len(resolutions) {
-		return LoopbackConfig{}, fmt.Errorf("no resolution selected")
-	}
-
-	fpsText := u.framerateCombo.ItemText(fpsIdx)
-	if fpsText == "" || fpsText == "(none)" {
-		return LoopbackConfig{}, fmt.Errorf("no frame rate selected")
-	}
-	fps, err := parseFPSLabel(fpsText)
+	cfg, err := u.captureConfig()
 	if err != nil {
-		return LoopbackConfig{}, fmt.Errorf("invalid frame rate: %w", err)
+		return LoopbackConfig{}, err
 	}
 
 	name := strings.TrimSpace(u.loopbackName.Text())
@@ -214,15 +217,8 @@ func (u *ui) loopbackConfig() (LoopbackConfig, error) {
 		return LoopbackConfig{}, fmt.Errorf("no loopback name")
 	}
 
-	res := resolutions[resIdx]
-	return LoopbackConfig{
-		Name:      name,
-		Source:    u.cameras[camIdx].Device,
-		Format:    u.cameras[camIdx].ColorFormats[fmtIdx].ShortName,
-		Width:     res.Width,
-		Height:    res.Height,
-		FrameRate: fps,
-	}, nil
+	cfg.Name = name
+	return cfg, nil
 }
 
 func (u *ui) defaultLoopbackName() string {
@@ -310,16 +306,29 @@ func (u *ui) onColorFormatChanged(index int) {
 		return
 	}
 
+	prevResolution := u.resolutionCombo.CurrentText()
+	prevFramerate := u.framerateCombo.CurrentText()
+
 	resolutions := sortedResolutions(u.cameras[camIdx].ColorFormats[index].Resolutions)
-	labels := make([]string, len(resolutions))
-	for i, res := range resolutions {
-		labels[i] = resolutionLabel(res)
-	}
-	u.fillCombo(u.resolutionCombo, labels)
-	u.onResolutionChanged(0)
+	resLabels := resolutionLabels(resolutions)
+	resIdx := findResolutionLabelIndex(resolutions, prevResolution)
+	u.fillComboSelect(u.resolutionCombo, resLabels, resIdx)
+
+	u.populateFramerates(resIdx, prevFramerate)
+	u.applyCaptureSettings()
 }
 
 func (u *ui) onResolutionChanged(index int) {
+	prevFramerate := u.framerateCombo.CurrentText()
+	u.populateFramerates(index, prevFramerate)
+	u.applyCaptureSettings()
+}
+
+func (u *ui) onFramerateChanged(_ int) {
+	u.applyCaptureSettings()
+}
+
+func (u *ui) populateFramerates(resIdx int, preferFramerate string) {
 	camIdx := u.cameraCombo.CurrentIndex()
 	fmtIdx := u.colorFormatCombo.CurrentIndex()
 	resolutions := []V42L_Resolution{}
@@ -327,17 +336,65 @@ func (u *ui) onResolutionChanged(index int) {
 		fmtIdx >= 0 && fmtIdx < len(u.cameras[camIdx].ColorFormats) {
 		resolutions = sortedResolutions(u.cameras[camIdx].ColorFormats[fmtIdx].Resolutions)
 	}
-	if index < 0 || index >= len(resolutions) {
+	if resIdx < 0 || resIdx >= len(resolutions) {
 		u.fillCombo(u.framerateCombo, nil)
 		return
 	}
 
-	rates := resolutions[index].FrameRates
-	labels := make([]string, len(rates))
-	for i, fps := range rates {
-		labels[i] = fpsLabel(fps)
+	rates := resolutions[resIdx].FrameRates
+	fpsLabels := fpsLabels(rates)
+	fpsIdx := findFPSLabelIndex(rates, preferFramerate)
+	u.fillComboSelect(u.framerateCombo, fpsLabels, fpsIdx)
+}
+
+func (u *ui) applyCaptureSettings() {
+	if u.loopbackActive {
+		return
 	}
-	u.fillCombo(u.framerateCombo, labels)
+
+	cfg, err := u.captureConfig()
+	if err != nil {
+		return
+	}
+
+	_ = ConfigureCapture(cfg)
+}
+
+func (u *ui) captureConfig() (LoopbackConfig, error) {
+	camIdx := u.cameraCombo.CurrentIndex()
+	fmtIdx := u.colorFormatCombo.CurrentIndex()
+	resIdx := u.resolutionCombo.CurrentIndex()
+	fpsIdx := u.framerateCombo.CurrentIndex()
+
+	if camIdx < 0 || camIdx >= len(u.cameras) {
+		return LoopbackConfig{}, fmt.Errorf("no camera selected")
+	}
+	if fmtIdx < 0 || fmtIdx >= len(u.cameras[camIdx].ColorFormats) {
+		return LoopbackConfig{}, fmt.Errorf("no color format selected")
+	}
+
+	resolutions := sortedResolutions(u.cameras[camIdx].ColorFormats[fmtIdx].Resolutions)
+	if resIdx < 0 || resIdx >= len(resolutions) {
+		return LoopbackConfig{}, fmt.Errorf("no resolution selected")
+	}
+
+	fpsText := u.framerateCombo.ItemText(fpsIdx)
+	if fpsText == "" || fpsText == "(none)" {
+		return LoopbackConfig{}, fmt.Errorf("no frame rate selected")
+	}
+	fps, err := parseFPSLabel(fpsText)
+	if err != nil {
+		return LoopbackConfig{}, fmt.Errorf("invalid frame rate: %w", err)
+	}
+
+	res := resolutions[resIdx]
+	return LoopbackConfig{
+		Source:    u.cameras[camIdx].Device,
+		Format:    u.cameras[camIdx].ColorFormats[fmtIdx].ShortName,
+		Width:     res.Width,
+		Height:    res.Height,
+		FrameRate: fps,
+	}, nil
 }
 
 func (u *ui) fillColorFormats(formats []V42L_ColorFormat) {
@@ -371,6 +428,10 @@ func (u *ui) updateColorFormatTooltip() {
 }
 
 func (u *ui) fillCombo(combo *qt6.QComboBox, items []string) {
+	u.fillComboSelect(combo, items, 0)
+}
+
+func (u *ui) fillComboSelect(combo *qt6.QComboBox, items []string, index int) {
 	combo.BlockSignals(true)
 	defer combo.BlockSignals(false)
 
@@ -383,6 +444,51 @@ func (u *ui) fillCombo(combo *qt6.QComboBox, items []string) {
 
 	combo.SetEnabled(!u.loopbackActive)
 	combo.AddItems(items)
+
+	if index < 0 || index >= len(items) {
+		index = 0
+	}
+	combo.SetCurrentIndex(index)
+}
+
+func resolutionLabels(resolutions []V42L_Resolution) []string {
+	labels := make([]string, len(resolutions))
+	for i, res := range resolutions {
+		labels[i] = resolutionLabel(res)
+	}
+	return labels
+}
+
+func fpsLabels(rates []float32) []string {
+	labels := make([]string, len(rates))
+	for i, fps := range rates {
+		labels[i] = fpsLabel(fps)
+	}
+	return labels
+}
+
+func findResolutionLabelIndex(resolutions []V42L_Resolution, label string) int {
+	if label == "" || label == "(none)" {
+		return 0
+	}
+	for i, res := range resolutions {
+		if resolutionLabel(res) == label {
+			return i
+		}
+	}
+	return 0
+}
+
+func findFPSLabelIndex(rates []float32, label string) int {
+	if label == "" || label == "(none)" {
+		return 0
+	}
+	for i, fps := range rates {
+		if fpsLabel(fps) == label {
+			return i
+		}
+	}
+	return 0
 }
 
 func sortedResolutions(res []V42L_Resolution) []V42L_Resolution {

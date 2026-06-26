@@ -18,15 +18,18 @@ func TestFFmpegInputFormat(t *testing.T) {
 	}
 }
 
+func TestV4L2PixelFormat(t *testing.T) {
+	if v4l2PixelFormat("MJPEG") != "MJPG" {
+		t.Fatal("MJPEG mapping failed")
+	}
+	if v4l2PixelFormat("YUYV") != "YUYV" {
+		t.Fatal("YUYV mapping failed")
+	}
+}
+
 func TestParseFPSLabel(t *testing.T) {
 	fps, err := parseFPSLabel("60 fps")
 	if err != nil || fps != 60 {
 		t.Fatalf("unexpected fps: %v %v", fps, err)
-	}
-}
-
-func TestLoopbackFrameByteSize(t *testing.T) {
-	if got := loopbackFrameByteSize(2560, 1440); got != 7372800 {
-		t.Fatalf("unexpected frame size: %d", got)
 	}
 }
