@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +12,8 @@ import (
 )
 
 type LoopbackConfig struct {
-	Name      string
 	Source    V4L2_Device
+	Target    V4L2_Device // pre-existing v4l2loopback device (e.g. /dev/video10)
 	Format    string
 	Width     int
 	Height    int
@@ -31,14 +30,12 @@ type Loopback struct {
 	mu           sync.Mutex
 }
 
-var reLoopbackDevice = regexp.MustCompile(`/dev/video\d+`)
-
 func (cfg LoopbackConfig) Start() (*Loopback, error) {
 	if cfg.Source == "" {
 		return nil, fmt.Errorf("no source device")
 	}
-	if cfg.Name == "" {
-		return nil, fmt.Errorf("no loopback name")
+	if cfg.Target == "" {
+		return nil, fmt.Errorf("no target loopback device (e.g. /dev/video10)")
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 {
 		return nil, fmt.Errorf("invalid resolution %dx%d", cfg.Width, cfg.Height)
@@ -50,23 +47,17 @@ func (cfg LoopbackConfig) Start() (*Loopback, error) {
 		return nil, fmt.Errorf("no pixel format")
 	}
 
-	device, err := createLoopbackDevice(cfg)
-	if err != nil {
-		return nil, err
-	}
-
 	lb := &Loopback{
 		cfg:          cfg,
-		outputDevice: device,
+		outputDevice: cfg.Target,
 		stop:         make(chan struct{}),
 	}
 
 	if err := lb.startPipeline(); err != nil {
-		_ = deleteLoopbackDevice(device)
 		return nil, err
 	}
 
-	logLoopbackReady(device)
+	logLoopbackReady(lb.outputDevice)
 	return lb, nil
 }
 
@@ -80,18 +71,10 @@ func (lb *Loopback) Stop() error {
 
 		lb.mu.Lock()
 		cmd := lb.ffmpeg
-		device := lb.outputDevice
 		lb.ffmpeg = nil
-		lb.outputDevice = ""
 		lb.mu.Unlock()
 
 		waitProcessExit(cmd, 3*time.Second)
-
-		if device != "" {
-			if err := deleteLoopbackDevice(device); err != nil {
-				lb.stopErr = err
-			}
-		}
 	})
 
 	return lb.stopErr
@@ -182,6 +165,7 @@ func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
 		if err := syscall.Kill(pid, 0); err != nil {
 			return
 		}
+
 		time.Sleep(50 * time.Millisecond)
 	}
 
@@ -190,63 +174,9 @@ func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
 		if err := syscall.Kill(pid, 0); err != nil {
 			return
 		}
+
 		time.Sleep(50 * time.Millisecond)
 	}
-}
-
-func createLoopbackDevice(cfg LoopbackConfig) (V4L2_Device, error) {
-	fps := int(cfg.FrameRate + 0.5)
-	out, err := loopbackCtl(
-		"add",
-		"-n", cfg.Name,
-		"-w", strconv.Itoa(cfg.Width),
-		"-h", strconv.Itoa(cfg.Height),
-		"--min-width", strconv.Itoa(cfg.Width),
-		"--min-height", strconv.Itoa(cfg.Height),
-		"-b", "8",
-		"-o", "8",
-		"-x", "1",
-		"-v",
-	)
-	if err != nil {
-		return "", err
-	}
-
-	device, ok := parseLoopbackDevice(out)
-	if !ok {
-		return "", fmt.Errorf("could not find loopback device in: %s", strings.TrimSpace(out))
-	}
-
-	if _, err := loopbackCtl("set-fps", string(device), strconv.Itoa(fps)); err != nil {
-		_ = deleteLoopbackDevice(device)
-		return "", err
-	}
-
-	return device, nil
-}
-
-func configureLoopbackDevice(device V4L2_Device, cfg LoopbackConfig) error {
-	_, err := v4l2Ctl(
-		"-d", string(device),
-		fmt.Sprintf("--set-fmt-video-out=width=%d,height=%d,pixelformat=YUYV", cfg.Width, cfg.Height),
-	)
-	if err != nil {
-		return err
-	}
-
-	// Repeat frames at the target rate so PipeWire/Chromium consumers see a live stream.
-	_, _ = v4l2Ctl("-d", string(device), "-c", "sustain_framerate=1")
-	return nil
-}
-
-func logLoopbackReady(device V4L2_Device) {
-	fmt.Fprintf(os.Stderr, "[cam-config] loopback ready at %s\n", device)
-	fmt.Fprintf(os.Stderr, "[cam-config] flatpak browsers reach cameras via PipeWire; if video stays blank, try a native browser or grant device access with flatpak override --user --device=all <app-id>\n")
-}
-
-func deleteLoopbackDevice(device V4L2_Device) error {
-	_, err := loopbackCtl("delete", string(device))
-	return err
 }
 
 // ConfigureCapture applies the selected format and frame rate to the source device.
@@ -265,6 +195,25 @@ func configureCapture(cfg LoopbackConfig) error {
 	}
 	_, err = v4l2Ctl("-d", string(cfg.Source), "-p", strconv.Itoa(fps))
 	return err
+}
+
+func configureLoopbackDevice(device V4L2_Device, cfg LoopbackConfig) error {
+	_, err := v4l2Ctl(
+		"-d", string(device),
+		fmt.Sprintf("--set-fmt-video-out=width=%d,height=%d,pixelformat=YUYV", cfg.Width, cfg.Height),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Repeat frames at the target rate so PipeWire/Chromium consumers see a live stream.
+	_, _ = v4l2Ctl("-d", string(device), "-c", "sustain_framerate=1")
+	return nil
+}
+
+func logLoopbackReady(device V4L2_Device) {
+	fmt.Fprintf(os.Stderr, "[cam-config] streaming to loopback at %s\n", device)
+	fmt.Fprintf(os.Stderr, "[cam-config] flatpak browsers reach cameras via PipeWire; if video stays blank, try a native browser or grant device access with flatpak override --user --device=all <app-id>\n")
 }
 
 func startFFmpeg(cfg LoopbackConfig, output V4L2_Device) (*exec.Cmd, error) {
@@ -303,28 +252,6 @@ func startFFmpeg(cfg LoopbackConfig, output V4L2_Device) (*exec.Cmd, error) {
 	}
 
 	return cmd, nil
-}
-
-func loopbackCtl(args ...string) (string, error) {
-	out, err := exec.Command("v4l2loopback-ctl", args...).CombinedOutput()
-	logCmdOutput("v4l2loopback-ctl", args, string(out), err)
-	if err != nil {
-		return string(out), fmt.Errorf(
-			"v4l2loopback-ctl %s: %w: %s",
-			strings.Join(args, " "),
-			err,
-			strings.TrimSpace(string(out)),
-		)
-	}
-	return string(out), nil
-}
-
-func parseLoopbackDevice(output string) (V4L2_Device, bool) {
-	matches := reLoopbackDevice.FindAllString(output, -1)
-	if len(matches) == 0 {
-		return "", false
-	}
-	return V4L2_Device(matches[len(matches)-1]), true
 }
 
 func v4l2PixelFormat(fourcc string) string {
