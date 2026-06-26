@@ -198,3 +198,34 @@ func parseFormatsExt(output string) []V42L_ColorFormat {
 
 	return formats
 }
+
+// IsV4L2Loopback returns true if the device is backed by the v4l2loopback kernel module.
+func IsV4L2Loopback(dev V4L2_Device) bool {
+	out, err := v4l2Ctl("--all", "-d", string(dev))
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "v4l2loopback") || strings.Contains(out, "Dummy video device")
+}
+
+// ListLoopbackDevices returns detected v4l2loopback devices with their card names.
+func ListLoopbackDevices() ([]Camera, error) {
+	groups, err := ListAllDevices()
+	if err != nil {
+		return nil, err
+	}
+
+	var loopbacks []Camera
+	for _, devices := range groups {
+		for _, dev := range devices {
+			if IsV4L2Loopback(dev) {
+				cam, err := GetCamera(string(dev))
+				if err == nil {
+					loopbacks = append(loopbacks, cam)
+				}
+			}
+		}
+	}
+	return loopbacks, nil
+}
