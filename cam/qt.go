@@ -172,7 +172,7 @@ func (u *ui) toggleLoopback() {
 			u.loopback = lb
 			u.loopbackDevice.SetPlaceholderText("Target loopback device")
 			u.setLoopbackActive(true)
-		})
+	})
 	}()
 }
 
@@ -483,7 +483,7 @@ func sortedResolutions(res []V42L_Resolution) []V42L_Resolution {
 	out := slices.Clone(res)
 	slices.SortFunc(out, func(a, b V42L_Resolution) int {
 		pa := a.Width * a.Height
-		pb := b.Width * a.Height
+		pb := b.Width * b.Height
 		if pa > pb {
 			return -1
 		}
