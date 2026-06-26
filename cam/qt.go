@@ -11,7 +11,8 @@ import (
 )
 
 type ui struct {
-	loopbackDevice   *qt6.QLineEdit
+	targetCombo      *qt6.QComboBox
+	targetRefreshBtn *qt6.QPushButton
 	loopbackBtn      *qt6.QPushButton
 	resetBtn         *qt6.QPushButton
 	cameraCombo      *qt6.QComboBox
@@ -21,6 +22,7 @@ type ui struct {
 	framerateCombo   *qt6.QComboBox
 
 	cameras        []Camera
+	targets        []Camera
 	loopback       *Loopback
 	loopbackActive bool
 	shuttingDown   bool
@@ -40,7 +42,7 @@ func RunGUI(args []string) {
 	win := qt6.NewQWidget(nil)
 	win.SetWindowTitle("Cam Config")
 	win.SetWindowIcon(icon)
-	win.SetMinimumSize2(360, 120)
+	win.SetMinimumSize2(400, 140)
 
 	style := qt6.QApplication_Style()
 	u := &ui{
@@ -48,8 +50,12 @@ func RunGUI(args []string) {
 		stopIcon: style.StandardIcon(qt6.QStyle__SP_MediaStop, nil, nil),
 	}
 
-	u.loopbackDevice = qt6.NewQLineEdit2()
-	u.loopbackDevice.SetPlaceholderText("Target loopback e.g. /dev/video10 (pre-created via akmod or modprobe)")
+	u.targetCombo = qt6.NewQComboBox2()
+	u.targetCombo.SetMinimumWidth(200)
+
+	u.targetRefreshBtn = qt6.NewQPushButton2()
+	u.targetRefreshBtn.SetIcon(style.StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil))
+	u.targetRefreshBtn.OnClicked(func() { u.refreshTargets() })
 
 	u.loopbackBtn = qt6.NewQPushButton2()
 	u.loopbackBtn.SetIcon(u.playIcon)
@@ -79,10 +85,11 @@ func RunGUI(args []string) {
 	u.framerateCombo = qt6.NewQComboBox2()
 	u.framerateCombo.OnCurrentIndexChanged(u.onFramerateChanged)
 
-	loopbackRow := qt6.NewQHBoxLayout2()
-	loopbackRow.AddWidget2(u.loopbackDevice.QWidget, 1)
-	loopbackRow.AddWidget(u.resetBtn.QWidget)
-	loopbackRow.AddWidget(u.loopbackBtn.QWidget)
+	targetRow := qt6.NewQHBoxLayout2()
+	targetRow.AddWidget2(u.targetCombo.QWidget, 1)
+	targetRow.AddWidget(u.targetRefreshBtn.QWidget)
+	targetRow.AddWidget(u.resetBtn.QWidget)
+	targetRow.AddWidget(u.loopbackBtn.QWidget)
 
 	cameraRow := qt6.NewQHBoxLayout2()
 	cameraRow.AddWidget2(u.cameraCombo.QWidget, 1)
@@ -96,11 +103,12 @@ func RunGUI(args []string) {
 	root := qt6.NewQVBoxLayout(win)
 	root.SetContentsMargins(12, 12, 12, 12)
 	root.SetSpacing(8)
-	root.AddLayout(loopbackRow.QLayout)
+	root.AddLayout(targetRow.QLayout)
 	root.AddLayout(cameraRow.QLayout)
 	root.AddLayout(formatRow.QLayout)
 
 	u.refreshCameras()
+	u.refreshTargets()
 	win.OnCloseEvent(func(_ func(_ *qt6.QCloseEvent), _ *qt6.QCloseEvent) {
 		u.shuttingDown = true
 		u.shutdownLoopback()
@@ -112,7 +120,8 @@ func RunGUI(args []string) {
 func (u *ui) setLoopbackActive(active bool) {
 	u.loopbackActive = active
 
-	u.loopbackDevice.SetEnabled(!active)
+	u.targetCombo.SetEnabled(!active)
+	u.targetRefreshBtn.SetEnabled(!active)
 	u.cameraCombo.SetEnabled(!active)
 	u.refreshBtn.SetEnabled(!active)
 	u.colorFormatCombo.SetEnabled(!active)
@@ -138,7 +147,7 @@ func (u *ui) resetLoopback() {
 	err := lb.Reset()
 	u.resetBtn.SetEnabled(true)
 	if err != nil {
-		u.loopbackDevice.SetPlaceholderText(err.Error())
+		// could show in status later
 	}
 }
 
@@ -150,7 +159,7 @@ func (u *ui) toggleLoopback() {
 
 	cfg, err := u.loopbackConfig()
 	if err != nil {
-		u.loopbackDevice.SetPlaceholderText(err.Error())
+		// For simplicity, we can log or ignore; in real use add a status label
 		return
 	}
 
@@ -166,13 +175,11 @@ func (u *ui) toggleLoopback() {
 			}
 			u.loopbackBtn.SetEnabled(true)
 			if err != nil {
-				u.loopbackDevice.SetPlaceholderText(err.Error())
 				return
 			}
 			u.loopback = lb
-			u.loopbackDevice.SetPlaceholderText("Target loopback device")
 			u.setLoopbackActive(true)
-	})
+		})
 	}()
 }
 
@@ -181,16 +188,12 @@ func (u *ui) stopLoopback() {
 	u.loopback = nil
 	u.loopbackBtn.SetEnabled(false)
 
-	var err error
 	if lb != nil {
-		err = lb.Stop()
+		_ = lb.Stop()
 	}
 
 	u.loopbackBtn.SetEnabled(true)
 	u.setLoopbackActive(false)
-	if err != nil {
-		u.loopbackDevice.SetPlaceholderText(err.Error())
-	}
 }
 
 func (u *ui) shutdownLoopback() {
@@ -208,12 +211,12 @@ func (u *ui) loopbackConfig() (LoopbackConfig, error) {
 		return LoopbackConfig{}, err
 	}
 
-	dev := strings.TrimSpace(u.loopbackDevice.Text())
-	if dev == "" {
-		return LoopbackConfig{}, fmt.Errorf("no target loopback device (e.g. /dev/video10)")
+	tIdx := u.targetCombo.CurrentIndex()
+	if tIdx < 0 || tIdx >= len(u.targets) {
+		return LoopbackConfig{}, fmt.Errorf("no target loopback selected")
 	}
 
-	cfg.Target = V4L2_Device(dev)
+	cfg.Target = u.targets[tIdx].Device
 	return cfg, nil
 }
 
@@ -254,6 +257,33 @@ func (u *ui) refreshCameras() {
 	}()
 }
 
+func (u *ui) refreshTargets() {
+	u.targetRefreshBtn.SetEnabled(false)
+
+	go func() {
+		loopbacks, err := ListLoopbackDevices()
+		mainthread.Start(func() {
+			if !u.loopbackActive {
+				u.targetRefreshBtn.SetEnabled(true)
+			}
+			if err != nil || len(loopbacks) == 0 {
+				u.targets = nil
+				u.fillCombo(u.targetCombo, []string{"(no loopback devices found - create one with akmod/modprobe)"})
+				u.targetCombo.SetEnabled(false)
+				return
+			}
+
+			u.targets = loopbacks
+			labels := make([]string, len(loopbacks))
+			for i, lb := range loopbacks {
+				labels[i] = lb.Label()
+			}
+			u.fillCombo(u.targetCombo, labels)
+			u.targetCombo.SetEnabled(!u.loopbackActive)
+		})
+	}()
+}
+
 func enumerateCameras() ([]Camera, error) {
 	groups, err := ListAllDevices()
 	if err != nil {
@@ -263,6 +293,9 @@ func enumerateCameras() ([]Camera, error) {
 	var cameras []Camera
 	for _, devices := range groups {
 		for _, dev := range devices {
+			if IsV4L2Loopback(dev) {
+				continue // skip loopbacks from source list
+			}
 			cam, err := GetCamera(string(dev))
 			if err != nil || len(cam.ColorFormats) == 0 {
 				continue
