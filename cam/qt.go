@@ -25,8 +25,9 @@ type ui struct {
 
 	cameras []Camera
 	targets []Camera
-	loopback *Loopback
-	shuttingDown bool
+	loopback      *Loopback
+	shuttingDown  bool
+	windowFocused bool
 }
 
 func RunGUI(args []string) {
@@ -43,7 +44,9 @@ func RunGUI(args []string) {
 	win.SetWindowIcon(icon)
 	win.SetMinimumSize2(520, 420)
 
-	u := &ui{}
+	u := &ui{
+		windowFocused: true,
+	}
 
 	// === Top row: Source → Destination ===
 	u.sourceCombo = qt6.NewQComboBox2()
@@ -112,6 +115,14 @@ func RunGUI(args []string) {
 
 	u.refreshSources()
 	u.refreshTargets()
+
+	// Focus handling to pause preview when window is not active (CPU saving)
+	win.OnFocusInEvent(func(_ func(*qt6.QFocusEvent), _ *qt6.QFocusEvent) {
+		u.windowFocused = true
+	})
+	win.OnFocusOutEvent(func(_ func(*qt6.QFocusEvent), _ *qt6.QFocusEvent) {
+		u.windowFocused = false
+	})
 
 	win.OnCloseEvent(func(_ func(_ *qt6.QCloseEvent), _ *qt6.QCloseEvent) {
 		u.shuttingDown = true
@@ -334,6 +345,11 @@ func (u *ui) startPreview(device V4L2_Device) {
 		for {
 			if u.shuttingDown || u.loopback == nil {
 				return
+			}
+
+			if !u.windowFocused {
+				time.Sleep(400 * time.Millisecond) // save CPU when window not focused
+				continue
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
