@@ -11,7 +11,7 @@ import (
 )
 
 type ui struct {
-	loopbackName     *qt6.QLineEdit
+	loopbackDevice   *qt6.QLineEdit
 	loopbackBtn      *qt6.QPushButton
 	resetBtn         *qt6.QPushButton
 	cameraCombo      *qt6.QComboBox
@@ -48,8 +48,8 @@ func RunGUI(args []string) {
 		stopIcon: style.StandardIcon(qt6.QStyle__SP_MediaStop, nil, nil),
 	}
 
-	u.loopbackName = qt6.NewQLineEdit2()
-	u.loopbackName.SetPlaceholderText("Loopback device name")
+	u.loopbackDevice = qt6.NewQLineEdit2()
+	u.loopbackDevice.SetPlaceholderText("Target loopback e.g. /dev/video10 (pre-created via akmod or modprobe)")
 
 	u.loopbackBtn = qt6.NewQPushButton2()
 	u.loopbackBtn.SetIcon(u.playIcon)
@@ -80,7 +80,7 @@ func RunGUI(args []string) {
 	u.framerateCombo.OnCurrentIndexChanged(u.onFramerateChanged)
 
 	loopbackRow := qt6.NewQHBoxLayout2()
-	loopbackRow.AddWidget2(u.loopbackName.QWidget, 1)
+	loopbackRow.AddWidget2(u.loopbackDevice.QWidget, 1)
 	loopbackRow.AddWidget(u.resetBtn.QWidget)
 	loopbackRow.AddWidget(u.loopbackBtn.QWidget)
 
@@ -112,7 +112,7 @@ func RunGUI(args []string) {
 func (u *ui) setLoopbackActive(active bool) {
 	u.loopbackActive = active
 
-	u.loopbackName.SetEnabled(!active)
+	u.loopbackDevice.SetEnabled(!active)
 	u.cameraCombo.SetEnabled(!active)
 	u.refreshBtn.SetEnabled(!active)
 	u.colorFormatCombo.SetEnabled(!active)
@@ -138,7 +138,7 @@ func (u *ui) resetLoopback() {
 	err := lb.Reset()
 	u.resetBtn.SetEnabled(true)
 	if err != nil {
-		u.loopbackName.SetPlaceholderText(err.Error())
+		u.loopbackDevice.SetPlaceholderText(err.Error())
 	}
 }
 
@@ -148,13 +148,9 @@ func (u *ui) toggleLoopback() {
 		return
 	}
 
-	if strings.TrimSpace(u.loopbackName.Text()) == "" {
-		u.loopbackName.SetText(u.defaultLoopbackName())
-	}
-
 	cfg, err := u.loopbackConfig()
 	if err != nil {
-		u.loopbackName.SetPlaceholderText(err.Error())
+		u.loopbackDevice.SetPlaceholderText(err.Error())
 		return
 	}
 
@@ -170,11 +166,11 @@ func (u *ui) toggleLoopback() {
 			}
 			u.loopbackBtn.SetEnabled(true)
 			if err != nil {
-				u.loopbackName.SetPlaceholderText(err.Error())
+				u.loopbackDevice.SetPlaceholderText(err.Error())
 				return
 			}
 			u.loopback = lb
-			u.loopbackName.SetPlaceholderText("Loopback device name")
+			u.loopbackDevice.SetPlaceholderText("Target loopback device")
 			u.setLoopbackActive(true)
 		})
 	}()
@@ -193,7 +189,7 @@ func (u *ui) stopLoopback() {
 	u.loopbackBtn.SetEnabled(true)
 	u.setLoopbackActive(false)
 	if err != nil {
-		u.loopbackName.SetPlaceholderText(err.Error())
+		u.loopbackDevice.SetPlaceholderText(err.Error())
 	}
 }
 
@@ -212,21 +208,13 @@ func (u *ui) loopbackConfig() (LoopbackConfig, error) {
 		return LoopbackConfig{}, err
 	}
 
-	name := strings.TrimSpace(u.loopbackName.Text())
-	if name == "" {
-		return LoopbackConfig{}, fmt.Errorf("no loopback name")
+	dev := strings.TrimSpace(u.loopbackDevice.Text())
+	if dev == "" {
+		return LoopbackConfig{}, fmt.Errorf("no target loopback device (e.g. /dev/video10)")
 	}
 
-	cfg.Name = name
+	cfg.Target = V4L2_Device(dev)
 	return cfg, nil
-}
-
-func (u *ui) defaultLoopbackName() string {
-	camIdx := u.cameraCombo.CurrentIndex()
-	if camIdx < 0 || camIdx >= len(u.cameras) {
-		return ""
-	}
-	return u.cameras[camIdx].LoopbackName()
 }
 
 func (u *ui) refreshCameras() {
@@ -240,11 +228,11 @@ func (u *ui) refreshCameras() {
 			}
 			if err != nil {
 				u.cameras = nil
-				u.fillCombo(u.cameraCombo, []string{fmt.Sprintf("(error: %v)", err)})
-				u.fillColorFormats(nil)
-				u.fillCombo(u.resolutionCombo, nil)
-				u.fillCombo(u.framerateCombo, nil)
-				return
+			u.fillCombo(u.cameraCombo, []string{fmt.Sprintf("(error: %v)", err)})
+			u.fillColorFormats(nil)
+			u.fillCombo(u.resolutionCombo, nil)
+			u.fillCombo(u.framerateCombo, nil)
+			return
 			}
 
 			u.cameras = cameras
@@ -495,7 +483,7 @@ func sortedResolutions(res []V42L_Resolution) []V42L_Resolution {
 	out := slices.Clone(res)
 	slices.SortFunc(out, func(a, b V42L_Resolution) int {
 		pa := a.Width * a.Height
-		pb := b.Width * b.Height
+		pb := b.Width * a.Height
 		if pa > pb {
 			return -1
 		}
@@ -508,7 +496,7 @@ func sortedResolutions(res []V42L_Resolution) []V42L_Resolution {
 }
 
 func resolutionLabel(res V42L_Resolution) string {
-	return fmt.Sprintf("%d×%d", res.Width, res.Height)
+	return fmt.Sprintf("%d\u00d7%d", res.Width, res.Height)
 }
 
 func cameraIcon() *qt6.QIcon {
