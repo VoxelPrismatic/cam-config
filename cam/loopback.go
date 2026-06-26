@@ -1,6 +1,7 @@
 package cam
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,7 @@ type LoopbackConfig struct {
 	Target    V4L2_Device // pre-existing v4l2loopback device (e.g. /dev/video10)
 	Format    string
 	Width     int
-	Height    int
+	Height     int
 	FrameRate float32
 }
 
@@ -28,6 +29,7 @@ type Loopback struct {
 	stopOnce     sync.Once
 	stopErr      error
 	mu           sync.Mutex
+	staleCount   int
 }
 
 func (cfg LoopbackConfig) Start() (*Loopback, error) {
@@ -57,6 +59,7 @@ func (cfg LoopbackConfig) Start() (*Loopback, error) {
 		return nil, err
 	}
 
+	go lb.watchStaleFrames()
 	logLoopbackReady(lb.outputDevice)
 	return lb, nil
 }
@@ -94,6 +97,7 @@ func (lb *Loopback) Reset() error {
 	default:
 	}
 
+	lb.staleCount = 0
 	return lb.restartPipelineLocked("manual reset")
 }
 
@@ -138,6 +142,7 @@ func (lb *Loopback) restartPipelineLocked(reason string) error {
 
 	lb.ffmpeg = cmd
 	go lb.monitorFFmpeg(cmd)
+	lb.staleCount = 0
 	return nil
 }
 
@@ -150,6 +155,51 @@ func (lb *Loopback) monitorFFmpeg(cmd *exec.Cmd) {
 	if lb.ffmpeg == cmd {
 		lb.ffmpeg = nil
 	}
+}
+
+func (lb *Loopback) watchStaleFrames() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-lb.stop:
+			return
+		case <-ticker.C:
+			if lb.checkStale() {
+				lb.staleCount++
+				if lb.staleCount >= 3 {
+					lb.staleCount = 0
+					// Auto reset without holding watcher lock
+					go func() {
+						_ = lb.Reset()
+					}()
+				}
+			} else {
+				lb.staleCount = 0
+			}
+		}
+	}
+}
+
+func (lb *Loopback) checkStale() bool {
+	if lb == nil || lb.outputDevice == "" {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+
+	// Quick probe: try to read one frame from the loopback.
+	// If this hangs or fails repeatedly, the pipeline is stale.
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "v4l2", "-i", string(lb.outputDevice),
+		"-frames:v", "1",
+		"-f", "null", "-")
+
+	err := cmd.Run()
+	return err != nil
 }
 
 func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
