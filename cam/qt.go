@@ -11,23 +11,21 @@ import (
 )
 
 type ui struct {
-	targetCombo      *qt6.QComboBox
-	targetRefreshBtn *qt6.QPushButton
-	loopbackBtn      *qt6.QPushButton
-	resetBtn         *qt6.QPushButton
-	cameraCombo      *qt6.QComboBox
-	refreshBtn       *qt6.QPushButton
+	targetCombo *qt6.QComboBox
+	loopbackBtn *qt6.QPushButton
+	cameraCombo *qt6.QComboBox
+	refreshBtn  *qt6.QPushButton
 	colorFormatCombo *qt6.QComboBox
 	resolutionCombo  *qt6.QComboBox
 	framerateCombo   *qt6.QComboBox
 
-	cameras        []Camera
-	targets        []Camera
-	loopback       *Loopback
+	cameras []Camera
+	targets []Camera
+	loopback *Loopback
 	loopbackActive bool
-	shuttingDown   bool
-	playIcon       *qt6.QIcon
-	stopIcon       *qt6.QIcon
+	shuttingDown bool
+	playIcon *qt6.QIcon
+	stopIcon *qt6.QIcon
 }
 
 func RunGUI(args []string) {
@@ -53,25 +51,19 @@ func RunGUI(args []string) {
 	u.targetCombo = qt6.NewQComboBox2()
 	u.targetCombo.SetMinimumWidth(200)
 
-	u.targetRefreshBtn = qt6.NewQPushButton2()
-	u.targetRefreshBtn.SetIcon(style.StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil))
-	u.targetRefreshBtn.OnClicked(func() { u.refreshTargets() })
-
 	u.loopbackBtn = qt6.NewQPushButton2()
 	u.loopbackBtn.SetIcon(u.playIcon)
 	u.loopbackBtn.OnClicked(u.toggleLoopback)
-
-	u.resetBtn = qt6.NewQPushButton2()
-	u.resetBtn.SetIcon(style.StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil))
-	u.resetBtn.SetEnabled(false)
-	u.resetBtn.OnClicked(u.resetLoopback)
 
 	u.cameraCombo = qt6.NewQComboBox2()
 	u.cameraCombo.OnCurrentIndexChanged(u.onCameraChanged)
 
 	u.refreshBtn = qt6.NewQPushButton2()
 	u.refreshBtn.SetIcon(style.StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil))
-	u.refreshBtn.OnClicked(func() { u.refreshCameras() })
+	u.refreshBtn.OnClicked(func() {
+		u.refreshCameras()
+		u.refreshTargets()
+	})
 
 	u.colorFormatCombo = qt6.NewQComboBox2()
 	u.colorFormatCombo.OnCurrentIndexChanged(func(index int) {
@@ -87,8 +79,6 @@ func RunGUI(args []string) {
 
 	targetRow := qt6.NewQHBoxLayout2()
 	targetRow.AddWidget2(u.targetCombo.QWidget, 1)
-	targetRow.AddWidget(u.targetRefreshBtn.QWidget)
-	targetRow.AddWidget(u.resetBtn.QWidget)
 	targetRow.AddWidget(u.loopbackBtn.QWidget)
 
 	cameraRow := qt6.NewQHBoxLayout2()
@@ -121,33 +111,16 @@ func (u *ui) setLoopbackActive(active bool) {
 	u.loopbackActive = active
 
 	u.targetCombo.SetEnabled(!active)
-	u.targetRefreshBtn.SetEnabled(!active)
 	u.cameraCombo.SetEnabled(!active)
 	u.refreshBtn.SetEnabled(!active)
 	u.colorFormatCombo.SetEnabled(!active)
 	u.resolutionCombo.SetEnabled(!active)
 	u.framerateCombo.SetEnabled(!active)
 
-	u.resetBtn.SetEnabled(active)
-
 	if active {
 		u.loopbackBtn.SetIcon(u.stopIcon)
 	} else {
 		u.loopbackBtn.SetIcon(u.playIcon)
-	}
-}
-
-func (u *ui) resetLoopback() {
-	lb := u.loopback
-	if lb == nil {
-		return
-	}
-
-	u.resetBtn.SetEnabled(false)
-	err := lb.Reset()
-	u.resetBtn.SetEnabled(true)
-	if err != nil {
-		// could show in status later
 	}
 }
 
@@ -159,7 +132,6 @@ func (u *ui) toggleLoopback() {
 
 	cfg, err := u.loopbackConfig()
 	if err != nil {
-		// For simplicity, we can log or ignore; in real use add a status label
 		return
 	}
 
@@ -258,17 +230,12 @@ func (u *ui) refreshCameras() {
 }
 
 func (u *ui) refreshTargets() {
-	u.targetRefreshBtn.SetEnabled(false)
-
 	go func() {
 		loopbacks, err := ListLoopbackDevices()
 		mainthread.Start(func() {
-			if !u.loopbackActive {
-				u.targetRefreshBtn.SetEnabled(true)
-			}
 			if err != nil || len(loopbacks) == 0 {
 				u.targets = nil
-				u.fillCombo(u.targetCombo, []string{"(no loopback devices found - create one with akmod/modprobe)"})
+				u.fillCombo(u.targetCombo, []string{"(no loopback devices found)"})
 				u.targetCombo.SetEnabled(false)
 				return
 			}
@@ -294,7 +261,7 @@ func enumerateCameras() ([]Camera, error) {
 	for _, devices := range groups {
 		for _, dev := range devices {
 			if IsV4L2Loopback(dev) {
-				continue // skip loopbacks from source list
+				continue
 			}
 			cam, err := GetCamera(string(dev))
 			if err != nil || len(cam.ColorFormats) == 0 {
