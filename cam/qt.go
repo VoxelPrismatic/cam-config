@@ -1,15 +1,9 @@
 package cam
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"image"
-	"os/exec"
 	"slices"
 	"strconv"
-	"strings"
-	"time"
 
 	"github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/mainthread"
@@ -21,13 +15,12 @@ type ui struct {
 	colorFormatCombo *qt6.QComboBox
 	resolutionCombo  *qt6.QComboBox
 	framerateCombo   *qt6.QComboBox
-	previewLabel     *qt6.QLabel
 
-	cameras []Camera
-	targets []Camera
-	loopback      *Loopback
-	shuttingDown  bool
-	windowFocused bool
+	cameras  []Camera
+	targets  []Camera
+	loopback *Loopback
+
+	shuttingDown bool
 }
 
 func RunGUI(args []string) {
@@ -42,36 +35,32 @@ func RunGUI(args []string) {
 	win := qt6.NewQWidget(nil)
 	win.SetWindowTitle("Cam Config")
 	win.SetWindowIcon(icon)
-	win.SetMinimumSize2(520, 420)
+	win.SetFixedSize2(480, 160)
 
-	u := &ui{
-		windowFocused: true,
-	}
+	u := &ui{}
 
-	// === Top row: Source → Destination ===
+	// === Source row ===
+	sourceIcon := rowIconLabel(sourceRowIcon())
 	u.sourceCombo = qt6.NewQComboBox2()
-	u.sourceCombo.SetMinimumWidth(200)
 	u.sourceCombo.OnCurrentIndexChanged(func(index int) {
-		u.refreshSourcesIfNeeded()
 		u.onSourceChanged(index)
 		u.tryAutoUpdatePipeline()
 	})
 
-	arrowLabel := qt6.NewQLabel2("→")
-	arrowLabel.SetAlignment(qt6.Qt__AlignCenter)
-	arrowLabel.SetStyleSheet("font-size: 18pt; font-weight: bold;")
+	sourceRow := qt6.NewQHBoxLayout2()
+	sourceRow.AddWidget(sourceIcon.QWidget)
+	sourceRow.AddWidget2(u.sourceCombo.QWidget, 1)
 
+	// === Destination row ===
+	destIcon := rowIconLabel(destRowIcon())
 	u.destCombo = qt6.NewQComboBox2()
-	u.destCombo.SetMinimumWidth(200)
 	u.destCombo.OnCurrentIndexChanged(func(index int) {
-		u.refreshTargetsIfNeeded()
 		u.tryAutoUpdatePipeline()
 	})
 
-	topRow := qt6.NewQHBoxLayout2()
-	topRow.AddWidget2(u.sourceCombo.QWidget, 1)
-	topRow.AddWidget(arrowLabel.QWidget)
-	topRow.AddWidget2(u.destCombo.QWidget, 1)
+	destRow := qt6.NewQHBoxLayout2()
+	destRow.AddWidget(destIcon.QWidget)
+	destRow.AddWidget2(u.destCombo.QWidget, 1)
 
 	// === Middle row: Format / Resolution / FPS ===
 	u.colorFormatCombo = qt6.NewQComboBox2()
@@ -93,36 +82,32 @@ func RunGUI(args []string) {
 		u.tryAutoUpdatePipeline()
 	})
 
+	configureIcon := rowIconLabel(configureRowIcon())
+
+	refreshBtn := qt6.NewQToolButton2()
+	refreshBtn.SetIcon(refreshIcon())
+	refreshBtn.SetToolTip("Refresh devices and restart stream")
+	refreshBtn.SetAutoRaise(true)
+	refreshBtn.OnClicked(func() {
+		u.refreshDevices()
+		u.resetPipeline()
+	})
+
 	formatRow := qt6.NewQHBoxLayout2()
+	formatRow.AddWidget(configureIcon.QWidget)
 	formatRow.AddWidget2(u.colorFormatCombo.QWidget, 1)
 	formatRow.AddWidget2(u.resolutionCombo.QWidget, 1)
 	formatRow.AddWidget2(u.framerateCombo.QWidget, 1)
+	formatRow.AddWidget(refreshBtn.QWidget)
 
-	// === Preview ===
-	u.previewLabel = qt6.NewQLabel2()
-	u.previewLabel.SetMinimumSize2(320, 240)
-	u.previewLabel.SetAlignment(qt6.Qt__AlignCenter)
-	u.previewLabel.SetStyleSheet("background-color: #222; color: #888; border: 1px solid #444;")
-	u.previewLabel.SetText("Preview will appear here when streaming")
-
-	// Main layout
 	root := qt6.NewQVBoxLayout(win)
 	root.SetContentsMargins(12, 12, 12, 12)
 	root.SetSpacing(10)
-	root.AddLayout(topRow.QLayout)
+	root.AddLayout(sourceRow.QLayout)
+	root.AddLayout(destRow.QLayout)
 	root.AddLayout(formatRow.QLayout)
-	root.AddWidget2(u.previewLabel.QWidget, 1)
 
-	u.refreshSources()
-	u.refreshTargets()
-
-	// Focus handling to pause preview when window is not active (CPU saving)
-	win.OnFocusInEvent(func(_ func(*qt6.QFocusEvent), _ *qt6.QFocusEvent) {
-		u.windowFocused = true
-	})
-	win.OnFocusOutEvent(func(_ func(*qt6.QFocusEvent), _ *qt6.QFocusEvent) {
-		u.windowFocused = false
-	})
+	u.refreshDevices()
 
 	win.OnCloseEvent(func(_ func(_ *qt6.QCloseEvent), _ *qt6.QCloseEvent) {
 		u.shuttingDown = true
@@ -132,72 +117,32 @@ func RunGUI(args []string) {
 	win.Show()
 }
 
-// Refresh when user opens/interacts with dropdowns
-func (u *ui) refreshSourcesIfNeeded() {
+func (u *ui) refreshDevices() {
+	prevSource := u.sourceCombo.CurrentText()
+	prevDest := u.destCombo.CurrentText()
+
 	go func() {
 		cams, _ := enumerateCameras()
-		mainthread.Start(func() {
-			u.cameras = cams
-			labels := make([]string, len(cams))
-			for i, c := range cams {
-				labels[i] = c.Label()
-			}
-			if len(labels) == 0 {
-				labels = []string{"(no cameras)"}
-			}
-			u.fillCombo(u.sourceCombo, labels)
-		})
-	}()
-}
-
-func (u *ui) refreshTargetsIfNeeded() {
-	go func() {
 		lbs, _ := ListLoopbackDevices()
 		mainthread.Start(func() {
-			u.targets = lbs
-			labels := make([]string, len(lbs))
-			for i, lb := range lbs {
-				labels[i] = lb.Label()
-			}
-			if len(labels) == 0 {
-				labels = []string{"(no loopback devices found)"}
-			}
-			u.fillCombo(u.destCombo, labels)
-		})
-	}()
-}
-
-func (u *ui) refreshSources() {
-	go func() {
-		cams, _ := enumerateCameras()
-		mainthread.Start(func() {
 			u.cameras = cams
-			labels := make([]string, len(cams))
-			for i, c := range cams {
-				labels[i] = c.Label()
-			}
-			if len(labels) == 0 {
-				labels = []string{"(no cameras)"}
-			}
-			u.fillCombo(u.sourceCombo, labels)
+			u.targets = lbs
+			sourceLabels := cameraLabels(cams, "(no cameras)")
+			destLabels := cameraLabels(lbs, "(no loopback devices found)")
+			u.fillComboSelect(u.sourceCombo, sourceLabels, findLabelIndex(sourceLabels, prevSource))
+			u.fillComboSelect(u.destCombo, destLabels, findLabelIndex(destLabels, prevDest))
+			u.onSourceChanged(u.sourceCombo.CurrentIndex())
+			u.tryAutoUpdatePipeline()
 		})
 	}()
 }
 
-func (u *ui) refreshTargets() {
+func (u *ui) resetPipeline() {
+	if u.loopback == nil {
+		return
+	}
 	go func() {
-		lbs, _ := ListLoopbackDevices()
-		mainthread.Start(func() {
-			u.targets = lbs
-			labels := make([]string, len(lbs))
-			for i, lb := range lbs {
-				labels[i] = lb.Label()
-			}
-			if len(labels) == 0 {
-				labels = []string{"(no loopback devices found)"}
-			}
-			u.fillCombo(u.destCombo, labels)
-		})
+		_ = u.loopback.Reset()
 	}()
 }
 
@@ -226,14 +171,15 @@ func (u *ui) tryAutoUpdatePipeline() {
 					return
 				}
 				u.loopback = lb
-				u.startPreview(lb.OutputDevice())
 			})
 		}()
-	} else {
-		go func() {
-			_ = u.loopback.Reset()
-		}()
+		return
 	}
+
+	lb := u.loopback
+	go func() {
+		_ = lb.Reconfigure(cfg)
+	}()
 }
 
 func (u *ui) buildCurrentConfig() LoopbackConfig {
@@ -336,49 +282,6 @@ func (u *ui) shutdownLoopback() {
 	}
 }
 
-func (u *ui) startPreview(device V4L2_Device) {
-	if device == "" {
-		return
-	}
-
-	go func() {
-		for {
-			if u.shuttingDown || u.loopback == nil {
-				return
-			}
-
-			if !u.windowFocused {
-				time.Sleep(400 * time.Millisecond) // save CPU when window not focused
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-			cmd := exec.CommandContext(ctx, "ffmpeg",
-				"-hide_banner", "-loglevel", "error",
-				"-f", "v4l2", "-i", string(device),
-				"-vf", "scale=320:-1",
-				"-frames:v", "1",
-				"-f", "image2pipe", "-")
-
-			out, err := cmd.Output()
-			cancel()
-
-			if err == nil && len(out) > 0 {
-				img, _, decodeErr := image.Decode(bytes.NewReader(out))
-				if decodeErr == nil && img != nil {
-					mainthread.Start(func() {
-						qimg := qt6.QImage_FromImage(img)
-						pix := qt6.QPixmap_FromImage(qimg)
-						u.previewLabel.SetPixmap(pix)
-					})
-				}
-			}
-
-			time.Sleep(150 * time.Millisecond)
-		}
-	}()
-}
-
 func (u *ui) fillColorFormats(formats []V42L_ColorFormat) {
 	u.colorFormatCombo.BlockSignals(true)
 	defer u.colorFormatCombo.BlockSignals(false)
@@ -433,6 +336,29 @@ func (u *ui) fillComboSelect(combo *qt6.QComboBox, items []string, index int) {
 	if index >= 0 && index < len(items) {
 		combo.SetCurrentIndex(index)
 	}
+}
+
+func cameraLabels(cams []Camera, empty string) []string {
+	if len(cams) == 0 {
+		return []string{empty}
+	}
+	labels := make([]string, len(cams))
+	for i, c := range cams {
+		labels[i] = c.Label()
+	}
+	return labels
+}
+
+func findLabelIndex(labels []string, prefer string) int {
+	if prefer == "" || prefer == "(none)" {
+		return 0
+	}
+	for i, label := range labels {
+		if label == prefer {
+			return i
+		}
+	}
+	return 0
 }
 
 func resolutionLabels(resolutions []V42L_Resolution) []string {
@@ -495,12 +421,51 @@ func resolutionLabel(res V42L_Resolution) string {
 	return fmt.Sprintf("%d\u00d7%d", res.Width, res.Height)
 }
 
-func cameraIcon() *qt6.QIcon {
-	for _, name := range []string{"camera-video", "camera-web", "camera-photo"} {
+func themeIcon(names ...string) *qt6.QIcon {
+	for _, name := range names {
 		icon := qt6.QIcon_FromTheme(name)
 		if !icon.IsNull() {
 			return icon
 		}
+	}
+	return qt6.NewQIcon()
+}
+
+func rowIconLabel(icon *qt6.QIcon) *qt6.QLabel {
+	label := qt6.NewQLabel2()
+	label.SetAlignment(qt6.AlignCenter)
+	label.SetPixmap(icon.Pixmap2(24, 24))
+	return label
+}
+
+func sourceRowIcon() *qt6.QIcon {
+	return themeIcon("camera-video-symbolic", "camera-video")
+}
+
+func destRowIcon() *qt6.QIcon {
+	icon := themeIcon("arrow-right-symbolic")
+	if !icon.IsNull() {
+		return icon
+	}
+	return qt6.QApplication_Style().StandardIcon(qt6.QStyle__SP_ArrowRight, nil, nil)
+}
+
+func refreshIcon() *qt6.QIcon {
+	icon := themeIcon("view-refresh-symbolic", "view-refresh")
+	if !icon.IsNull() {
+		return icon
+	}
+	return qt6.QApplication_Style().StandardIcon(qt6.QStyle__SP_BrowserReload, nil, nil)
+}
+
+func configureRowIcon() *qt6.QIcon {
+	return themeIcon("configure")
+}
+
+func cameraIcon() *qt6.QIcon {
+	icon := themeIcon("camera-video", "camera-web", "camera-photo")
+	if !icon.IsNull() {
+		return icon
 	}
 	return qt6.NewQIcon()
 }

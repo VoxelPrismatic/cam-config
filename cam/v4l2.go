@@ -209,6 +209,28 @@ func IsV4L2Loopback(dev V4L2_Device) bool {
 	return strings.Contains(lower, "v4l2loopback") || strings.Contains(out, "Dummy video device")
 }
 
+func enumerateCameras() ([]Camera, error) {
+	groups, err := ListAllDevices()
+	if err != nil {
+		return nil, err
+	}
+
+	var cameras []Camera
+	for _, devices := range groups {
+		for _, dev := range devices {
+			if IsV4L2Loopback(dev) {
+				continue
+			}
+			cam, err := GetCamera(string(dev))
+			if err != nil || len(cam.ColorFormats) == 0 {
+				continue
+			}
+			cameras = append(cameras, cam)
+		}
+	}
+	return cameras, nil
+}
+
 // ListLoopbackDevices returns detected v4l2loopback devices with their card names.
 func ListLoopbackDevices() ([]Camera, error) {
 	groups, err := ListAllDevices()

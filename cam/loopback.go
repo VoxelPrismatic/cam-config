@@ -1,7 +1,6 @@
 package cam
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -59,7 +58,9 @@ func (cfg LoopbackConfig) Start() (*Loopback, error) {
 		return nil, err
 	}
 
-	go lb.watchStaleFrames()
+	// Disabled: PipeWire often holds the loopback device open, so ffmpeg probe
+	// reads as stale and spuriously resets the pipeline.
+	// go lb.watchStaleFrames()
 	logLoopbackReady(lb.outputDevice)
 	return lb, nil
 }
@@ -99,6 +100,26 @@ func (lb *Loopback) Reset() error {
 
 	lb.staleCount = 0
 	return lb.restartPipelineLocked("manual reset")
+}
+
+func (lb *Loopback) Reconfigure(cfg LoopbackConfig) error {
+	if lb == nil {
+		return fmt.Errorf("loopback not running")
+	}
+
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	select {
+	case <-lb.stop:
+		return fmt.Errorf("loopback stopped")
+	default:
+	}
+
+	lb.cfg = cfg
+	lb.outputDevice = cfg.Target
+	lb.staleCount = 0
+	return lb.restartPipelineLocked("reconfigure")
 }
 
 func (lb *Loopback) OutputDevice() V4L2_Device {
@@ -157,6 +178,7 @@ func (lb *Loopback) monitorFFmpeg(cmd *exec.Cmd) {
 	}
 }
 
+/*
 func (lb *Loopback) watchStaleFrames() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -170,7 +192,6 @@ func (lb *Loopback) watchStaleFrames() {
 				lb.staleCount++
 				if lb.staleCount >= 3 {
 					lb.staleCount = 0
-					// Auto reset without holding watcher lock
 					go func() {
 						_ = lb.Reset()
 					}()
@@ -190,8 +211,6 @@ func (lb *Loopback) checkStale() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
 	defer cancel()
 
-	// Quick probe: try to read one frame from the loopback.
-	// If this hangs or fails repeatedly, the pipeline is stale.
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-hide_banner", "-loglevel", "error",
 		"-f", "v4l2", "-i", string(lb.outputDevice),
@@ -201,6 +220,7 @@ func (lb *Loopback) checkStale() bool {
 	err := cmd.Run()
 	return err != nil
 }
+*/
 
 func waitProcessExit(cmd *exec.Cmd, timeout time.Duration) {
 	if cmd == nil || cmd.Process == nil {
@@ -291,6 +311,8 @@ func startFFmpeg(cfg LoopbackConfig, output V4L2_Device) (*exec.Cmd, error) {
 		"-f", "v4l2",
 		string(output),
 	}
+
+	logCmdOutput("ffmpeg", args, "", nil)
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
